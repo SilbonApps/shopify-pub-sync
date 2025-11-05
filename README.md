@@ -49,3 +49,15 @@ marketIds: [
 - Logs accesibles en Render → *Events*
 
 ---
+
+
+
+
+
+
+
+
+
+
+
+Autor: Javier García-Rojo Cantón — Lead Developer, Silbon
