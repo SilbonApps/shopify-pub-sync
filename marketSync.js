@@ -1,6 +1,7 @@
 // src/marketSync.js
 import fetch from "node-fetch";
 import "dotenv/config.js";
+import { httpsAgent } from "./agent.js";
 
 const SHOP = process.env.SHOP_DOMAIN;
 const TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
@@ -18,6 +19,7 @@ const pubCache = new Map();
 async function shopifyGraphQL(query, variables) {
   const res = await fetch(`${BASE}/graphql.json`, {
     method: "POST",
+    agent: httpsAgent,
     headers: {
       "Content-Type": "application/json",
       "X-Shopify-Access-Token": TOKEN,
@@ -76,14 +78,17 @@ async function publicationUpdate(pubId, { add = [], remove = [] }) {
 
 export async function syncMarkets(productGid, allZero) {
   console.log("syncMarkets()", { productGid, allZero, marketIds });
-  for (const marketId of marketIds) {
-    const publicationId = await getPublicationIdForMarket(marketId);
-    if (allZero) {
-      const errs = await publicationUpdate(publicationId, { remove: [productGid] });
-      console.log(`🛑 Unpublished from market ${marketId}`, errs);
-    } else {
-      const errs = await publicationUpdate(publicationId, { add: [productGid] });
-      console.log(`✅ Published to market ${marketId}`, errs);
-    }
-  }
+  await Promise.all(
+    marketIds.map(async marketId => {
+      const publicationId = await getPublicationIdForMarket(marketId);
+      const errs = allZero
+        ? await publicationUpdate(publicationId, { remove: [productGid] })
+        : await publicationUpdate(publicationId, { add: [productGid] });
+      if (errs.length) {
+        console.error(`⚠️ Market ${marketId} userErrors:`, errs);
+      } else {
+        console.log(`${allZero ? "🛑 Unpublished from" : "✅ Published to"} market ${marketId}`);
+      }
+    })
+  );
 }

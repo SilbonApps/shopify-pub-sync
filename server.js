@@ -4,8 +4,12 @@ import morgan from "morgan";
 import webhooks from "./webhooks.js";
 
 const app = express();
+app.disable("x-powered-by");
 app.use(morgan("dev"));
-app.use(express.json()); // importante
+
+// Body crudo en /webhooks: necesario para verificar la firma HMAC de Shopify
+app.use("/webhooks", express.raw({ type: "*/*" }));
+app.use(express.json());
 
 app.use("/", webhooks);
 
