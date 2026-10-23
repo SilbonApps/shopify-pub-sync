@@ -1,0 +1,362 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  pub-sync de Silbon: publica o despublica productos en Shopify Markets segun
+  el stock de la ubicacion central. Un receptor del webhook (Lambda tras API
+  Gateway HTTP) encola en SQS y un worker (Lambda) procesa por lotes agrupando
+  por producto. Se despliega con aws/deploy.ps1 usando solo el AWS CLI.
+
+Parameters:
+  SecretsPrefix:
+    Type: String
+    Default: /silbon/pub-sync
+    Description: >
+      Prefijo de los SecureString en SSM Parameter Store (SHOPIFY_ADMIN_TOKEN,
+      SHOPIFY_WEBHOOK_SECRET). Se crean fuera de la pila; deploy.ps1 comprueba
+      que existan.
+    AllowedPattern: '^/[a-zA-Z0-9/_.-]+[^/]$'
+
+  ShopDomain:
+    Type: String
+    Description: Dominio myshopify de la tienda (SHOP_DOMAIN). No secreto.
+
+  CentralLocationId:
+    Type: String
+    Description: ID numerico de la ubicacion central (CENTRAL_LOCATION_ID).
+    AllowedPattern: '^[0-9]+$'
+
+  MarketIds:
+    Type: String
+    Description: GIDs de los Markets a sincronizar, separados por comas (MARKET_IDS).
+
+  DebounceSeconds:
+    Type: Number
+    Default: 8
+    MinValue: 0
+    MaxValue: 900
+    Description: >
+      Retardo de entrega de la cola. Hace de debounce: los webhooks de un
+      mismo producto que llegan en rafaga se procesan juntos, una sola vez.
+
+  DomainName:
+    Type: String
+    Default: ''
+    Description: >
+      Dominio propio opcional, p. ej. pub-sync.silbon.es. Vacio = solo la URL
+      de execute-api. Si se indica hacen falta CertificateArn y HostedZoneId.
+    AllowedPattern: '^$|^[a-z0-9.-]+\.silbon\.es$'
+
+  CertificateArn:
+    Type: String
+    Default: ''
+    Description: >
+      Certificado ACM para DomainName. Tiene que estar en la MISMA region que
+      la pila (API Gateway regional), no en us-east-1.
+    AllowedPattern: '^$|^arn:aws:acm:[a-z0-9-]+:[0-9]{12}:certificate/.+$'
+
+  HostedZoneId:
+    Type: String
+    Default: ZDE8KK068AVPG
+    Description: Zona de silbon.es en Route53, donde se crea el alias del dominio.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 180, 365]
+
+Conditions:
+  HasDomain: !Not [!Equals [!Ref DomainName, '']]
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Colas: la principal con retardo (debounce) y la de mensajes muertos.
+  # ---------------------------------------------------------------------------
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-dlq'
+      MessageRetentionPeriod: 1209600 # 14 dias
+
+  Queue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-queue'
+      DelaySeconds: !Ref DebounceSeconds
+      # Minimo 6x el timeout del worker (120 s) para el mapping con lotes.
+      VisibilityTimeout: 720
+      MessageRetentionPeriod: 86400 # 1 dia: un cambio de stock de ayer ya no interesa
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  # ---------------------------------------------------------------------------
+  # Roles.
+  # ---------------------------------------------------------------------------
+  SecretsReadPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Lectura de los secretos de pub-sync en SSM
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - ssm:GetParameter
+              - ssm:GetParameters
+              - ssm:GetParametersByPath
+            Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SecretsPrefix}/*'
+          - Effect: Allow
+            Action: kms:Decrypt
+            Resource: !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+            Condition:
+              StringEquals:
+                'kms:ViaService': !Sub 'ssm.${AWS::Region}.amazonaws.com'
+
+  WebhookRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref SecretsReadPolicy
+      Policies:
+        - PolicyName: send-to-queue
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt Queue.Arn
+
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref SecretsReadPolicy
+      Policies:
+        - PolicyName: consume-queue
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:ChangeMessageVisibility
+                Resource: !GetAtt Queue.Arn
+
+  # ---------------------------------------------------------------------------
+  # Receptor del webhook.
+  # ---------------------------------------------------------------------------
+  WebhookLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-webhook'
+      RetentionInDays: !Ref LogRetentionDays
+
+  WebhookFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: WebhookLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-webhook'
+      Runtime: nodejs22.x
+      Handler: server/webhook.handler
+      Role: !GetAtt WebhookRole.Arn
+      Timeout: 10
+      MemorySize: 256
+      Architectures:
+        - arm64
+      Environment:
+        Variables:
+          TZ: Europe/Madrid
+          SECRETS_SSM_PREFIX: !Ref SecretsPrefix
+          QUEUE_URL: !Ref Queue
+          CENTRAL_LOCATION_ID: !Ref CentralLocationId
+          NODE_OPTIONS: --enable-source-maps
+      Code:
+        # Placeholder: el codigo real lo sube aws/deploy.ps1 con
+        # `aws lambda update-function-code`.
+        ZipFile: |
+          export const handler = async () => ({
+            statusCode: 503,
+            body: '{"error":"not_deployed_yet"}',
+          });
+
+  # ---------------------------------------------------------------------------
+  # Worker que consume la cola.
+  # ---------------------------------------------------------------------------
+  WorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-worker'
+      RetentionInDays: !Ref LogRetentionDays
+
+  WorkerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: WorkerLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-worker'
+      Runtime: nodejs22.x
+      Handler: server/worker.handler
+      Role: !GetAtt WorkerRole.Arn
+      Timeout: 120
+      MemorySize: 512
+      # Como mucho dos lotes a la vez contra la Admin API de Shopify.
+      ReservedConcurrentExecutions: 2
+      Architectures:
+        - arm64
+      Environment:
+        Variables:
+          TZ: Europe/Madrid
+          SECRETS_SSM_PREFIX: !Ref SecretsPrefix
+          SHOP_DOMAIN: !Ref ShopDomain
+          CENTRAL_LOCATION_ID: !Ref CentralLocationId
+          MARKET_IDS: !Ref MarketIds
+          NODE_OPTIONS: --enable-source-maps
+      Code:
+        ZipFile: |
+          export const handler = async () => {
+            throw new Error('not_deployed_yet');
+          };
+
+  WorkerEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt Queue.Arn
+      FunctionName: !Ref WorkerFunction
+      Enabled: true
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 5
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+  # ---------------------------------------------------------------------------
+  # API Gateway HTTP API para el receptor.
+  # ---------------------------------------------------------------------------
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${AWS::StackName}-webhook'
+      ProtocolType: HTTP
+
+  HttpApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt WebhookFunction.Arn
+      PayloadFormatVersion: '2.0'
+      TimeoutInMillis: 10000
+
+  HttpApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: $default
+      Target: !Sub 'integrations/${HttpApiIntegration}'
+
+  HttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: $default
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 200
+        ThrottlingRateLimit: 100
+
+  HttpApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt WebhookFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*'
+
+  # ---------------------------------------------------------------------------
+  # Dominio propio (opcional).
+  # ---------------------------------------------------------------------------
+  ApiDomain:
+    Type: AWS::ApiGatewayV2::DomainName
+    Condition: HasDomain
+    Properties:
+      DomainName: !Ref DomainName
+      DomainNameConfigurations:
+        - CertificateArn: !Ref CertificateArn
+          EndpointType: REGIONAL
+          SecurityPolicy: TLS_1_2
+
+  ApiDomainMapping:
+    Type: AWS::ApiGatewayV2::ApiMapping
+    Condition: HasDomain
+    DependsOn: HttpApiStage
+    Properties:
+      ApiId: !Ref HttpApi
+      DomainName: !Ref ApiDomain
+      Stage: $default
+
+  DnsRecordA:
+    Type: AWS::Route53::RecordSet
+    Condition: HasDomain
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt ApiDomain.RegionalDomainName
+        HostedZoneId: !GetAtt ApiDomain.RegionalHostedZoneId
+
+  DnsRecordAAAA:
+    Type: AWS::Route53::RecordSet
+    Condition: HasDomain
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt ApiDomain.RegionalDomainName
+        HostedZoneId: !GetAtt ApiDomain.RegionalHostedZoneId
+
+Outputs:
+  WebhookFunctionName:
+    Value: !Ref WebhookFunction
+
+  WorkerFunctionName:
+    Value: !Ref WorkerFunction
+
+  QueueName:
+    Value: !GetAtt Queue.QueueName
+
+  DeadLetterQueueName:
+    Value: !GetAtt DeadLetterQueue.QueueName
+
+  ApiUrl:
+    Description: URL base del API Gateway (siempre valida, con o sin dominio propio)
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+
+  PublicUrl:
+    Value: !If
+      - HasDomain
+      - !Sub 'https://${DomainName}'
+      - !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+
+  WebhookUrl:
+    Description: URL completa que debe llevar la suscripcion inventory_levels/update en Shopify
+    Value: !If
+      - HasDomain
+      - !Sub 'https://${DomainName}/webhooks/inventory_levels/update'
+      - !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/webhooks/inventory_levels/update'
