@@ -35,7 +35,8 @@ let published = {
   'gid://shopify/Product/2': { 'gid://shopify/Publication/10': false, 'gid://shopify/Publication/20': true },
 };
 
-const calls = { resolve: 0, levels: 0, market: 0, state: 0, mutations: [] };
+const calls = { resolve: 0, levels: 0, market: 0, state: 0, status: 0, mutations: [] };
+const DRAFTS = new Set(); // productos en borrador para la prueba
 
 function graphqlResponse(query, variables) {
   if (query.includes('inventoryItem(id:')) {
@@ -50,6 +51,7 @@ function graphqlResponse(query, variables) {
             product: {
               id: productGid,
               title: 'Producto',
+              status: DRAFTS.has(productGid) ? 'DRAFT' : 'ACTIVE',
               variants: {
                 edges: ITEMS[productGid].map((id) => ({
                   node: { id: `gid://shopify/ProductVariant/${id}`, inventoryItem: { id: `gid://shopify/InventoryItem/${id}` } },
@@ -60,6 +62,10 @@ function graphqlResponse(query, variables) {
         },
       },
     };
+  }
+  if (query.includes('product(id: $id) { status }')) {
+    calls.status += 1;
+    return { data: { product: { status: DRAFTS.has(variables.id) ? 'DRAFT' : 'ACTIVE' } } };
   }
   if (query.includes('market(id:')) {
     calls.market += 1;
@@ -251,6 +257,30 @@ await check('stock que vuelve: P1 se republica en las dos', async () => {
     ['add', 'gid://shopify/Publication/10', 'gid://shopify/Product/1'],
     ['add', 'gid://shopify/Publication/20', 'gid://shopify/Product/1'],
   ].sort());
+});
+
+await check('producto en borrador: ni stock ni Markets, y al activarse la siguiente pasada lo publica', async () => {
+  resetCaches();
+  DRAFTS.add('gid://shopify/Product/2');
+  published['gid://shopify/Product/2'] = { 'gid://shopify/Publication/10': false, 'gid://shopify/Publication/20': false };
+  Object.assign(calls, { resolve: 0, levels: 0, market: 0, state: 0, status: 0, mutations: [] });
+  let res = await worker(sqsEvent([{ inventoryItemId: '2001' }]));
+  assert.deepEqual(res, { batchItemFailures: [] });
+  assert.equal(calls.levels, 0, 'no consulta stock de un borrador');
+  assert.equal(calls.mutations.length, 0, 'no toca Markets');
+  // Segunda pasada en caliente, sigue en borrador: vuelve a preguntar el estado (no se cachea)
+  res = await worker(sqsEvent([{ inventoryItemId: '2001' }]));
+  assert.equal(calls.status, 2, 'el estado de un borrador se consulta en cada pasada (una por pasada)');
+  assert.equal(calls.mutations.length, 0);
+  // Se activa: la siguiente actualizacion de stock lo publica donde falte
+  DRAFTS.delete('gid://shopify/Product/2');
+  res = await worker(sqsEvent([{ inventoryItemId: '2001' }]));
+  assert.deepEqual(res, { batchItemFailures: [] });
+  assert.deepEqual(calls.mutations.sort(), [
+    ['add', 'gid://shopify/Publication/10', 'gid://shopify/Product/2'],
+    ['add', 'gid://shopify/Publication/20', 'gid://shopify/Product/2'],
+  ].sort());
+  published['gid://shopify/Product/2'] = { 'gid://shopify/Publication/10': true, 'gid://shopify/Publication/20': true };
 });
 
 await check('mensaje con JSON roto aparece en batchItemFailures y el resto se procesa', async () => {

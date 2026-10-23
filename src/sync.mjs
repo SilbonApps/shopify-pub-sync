@@ -5,17 +5,35 @@
 // una consulta extra. La idempotencia real no depende de ellas: syncMarkets
 // comprueba el estado en Shopify antes de mutar.
 
-import { getProductByInventoryItem, getAvailableByInventoryItemIdsREST } from './shopify.mjs';
+import { getProductByInventoryItem, getAvailableByInventoryItemIdsREST, getProductStatus } from './shopify.mjs';
 import { syncMarkets } from './marketSync.mjs';
 
 const itemToProduct = new Map(); // inventory_item_id -> productGid
 const productItems = new Map(); // productGid -> [inventory_item_id, ...]
 const lastAllZero = new Map(); // productGid -> ultimo allZero sincronizado
+// Solo se cachea ACTIVE: un borrador o archivado se vuelve a consultar en cada
+// pasada para que, en cuanto se active, la siguiente actualizacion de stock lo
+// publique. Un producto no activo no se puede publicar en ningun Market, y
+// publicationUpdate sobre el responde OK sin hacer nada (57 de 60 productos
+// de la primera hora en AWS eran borradores: 3 mutaciones inutiles cada uno).
+const activeProducts = new Set(); // productGid con status ACTIVE visto
 
 function cacheProduct(product) {
   const ids = product.variants.edges.map((e) => e.node.inventoryItem.id.split('/').pop());
   productItems.set(product.id, ids);
   for (const id of ids) itemToProduct.set(id, product.id);
+  if (product.status === 'ACTIVE') activeProducts.add(product.id);
+}
+
+async function isActive(productGid) {
+  if (activeProducts.has(productGid)) return true;
+  const status = await getProductStatus(productGid);
+  if (status === 'ACTIVE') {
+    activeProducts.add(productGid);
+    return true;
+  }
+  console.log(`${productGid} status=${status}: no se publica en Markets`);
+  return false;
 }
 
 export async function resolveProduct(inventoryItemId) {
@@ -30,6 +48,7 @@ export async function resolveProduct(inventoryItemId) {
 export async function processProduct(productGid) {
   const itemIds = productItems.get(productGid);
   if (!itemIds?.length) return { productGid, skipped: 'sin variantes en cache' };
+  if (!(await isActive(productGid))) return { productGid, skipped: 'producto no activo' };
 
   const central = String(process.env.CENTRAL_LOCATION_ID || '').trim();
   const availability = await getAvailableByInventoryItemIdsREST(itemIds, central);
@@ -86,4 +105,5 @@ export function resetCaches() {
   itemToProduct.clear();
   productItems.clear();
   lastAllZero.clear();
+  activeProducts.clear();
 }

@@ -38,6 +38,7 @@ export async function getProductByInventoryItem(inventoryItemId) {
           product {
             id
             title
+            status
             variants(first: 250) {
               edges { node { id inventoryItem { id } } }
             }
@@ -50,6 +51,13 @@ export async function getProductByInventoryItem(inventoryItemId) {
     id: `gid://shopify/InventoryItem/${inventoryItemId}`,
   });
   return json.data?.inventoryItem?.variant?.product || null;
+}
+
+// Estado del producto (ACTIVE / DRAFT / ARCHIVED). Consulta ligera para los
+// productos que no estaban activos la ultima vez: su estado no se cachea.
+export async function getProductStatus(productGid) {
+  const json = await shopifyGraphQL(`query($id: ID!) { product(id: $id) { status } }`, { id: productGid });
+  return json.data?.product?.status || null;
 }
 
 // REST inventory_levels.json: available de n inventory_items en UNA ubicacion.
